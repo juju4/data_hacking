@@ -8,7 +8,7 @@
 import os, sys
 import traceback
 import json
-import optparse
+import argparse
 import pickle
 import collections
 import sklearn
@@ -19,12 +19,22 @@ import pandas as pd
 import numpy as np
 import tldextract
 import math
+import re
 
+global clf
+global alexa_vc
+global alexa_counts
+global dict_vc
+global dict_counts
 
-# Version printing is always a good idea
-print 'Scikit Learn version: %s' % sklearn.__version__
-print 'Pandas version: %s' % pd.__version__
-print 'TLDExtract version: %s' % tldextract.__version__
+whitelist_domain = [
+    '.avqs.mcafee.com',
+    '.dbl.spamhaus.org', '.countries.nerd.dk',
+    'xn--',
+    '.metric.gstatic.com', '.metric.ipv6test.com', '.pack.google.com',
+    '.akamai.net', '.cloudfront.net', '.rackcdn.com', '.pixel.parsely.com'
+    ]   
+whitelist_domain_re = re.compile("^" + "|".join(map(re.escape, whitelist_domain)) + "$", re.IGNORECASE)
 
 # Version 0.12.0 of Pandas has a DeprecationWarning about Height blah that I'm ignoring
 import warnings
@@ -80,248 +90,240 @@ def load_model_from_disk(name, model_dir='models'):
 
     return model
 
-def main():
+def init(args=None):
+    global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+    try: 
+        #try:
+        if os.path.isfile("models/dga_model_random_forest.model"):
+            # Load model from disk
+            if args.verbose:
+                print 'Loading model from disk'
+            clf = load_model_from_disk('dga_model_random_forest')
+            alexa_vc = load_model_from_disk('dga_model_alexa_vectorizor')
+            alexa_counts = load_model_from_disk('dga_model_alexa_counts')
+            dict_vc = load_model_from_disk('dga_model_dict_vectorizor')
+            dict_counts = load_model_from_disk('dga_model_dict_counts')
+            if args.verbose:
+                print 'Loading ended'
 
-    ''' Main method, takes care of loading data, running it through the various analyses
-        and reporting the results
-    '''
+        #except:
+        else:
+            print 'Generating model'
+    
+            # This is the Alexa 1M domain list.
+            print 'Loading alexa dataframe...'
+            try:
+                alexa_file = args.alexa_file
+            except:
+                alexa_file = 'data/alexa_100k.csv'
+            alexa_dataframe = pd.read_csv(alexa_file, names=['rank','uri'], header=None, encoding='utf-8')
+            print alexa_dataframe.info()
+            print alexa_dataframe.head()
+    
+            # Compute the 2LD of the domain given by Alexa
+            alexa_dataframe['domain'] = [ domain_extract(uri) for uri in alexa_dataframe['uri']]
+            del alexa_dataframe['rank']
+            del alexa_dataframe['uri']
+            alexa_dataframe = alexa_dataframe.dropna()
+            alexa_dataframe = alexa_dataframe.drop_duplicates()
+            print alexa_dataframe.head()
+    
+            # Set the class
+            alexa_dataframe['class'] = 'legit'
+    
+            # Shuffle the data (important for training/testing)
+            alexa_dataframe = alexa_dataframe.reindex(np.random.permutation(alexa_dataframe.index))
+            alexa_total = alexa_dataframe.shape[0]
+            print 'Total Alexa domains %d' % alexa_total
+    
+    
+            # Read in the DGA domains
+            dga_dataframe = pd.read_csv('data/dga_domains.txt', names=['raw_domain'], header=None, encoding='utf-8')
+            ## https://raw.githubusercontent.com/Andrewaeva/DGA/
+            frame2 = pd.read_csv('data/matsnu.txt', names=['raw_domain'], header=None, encoding='utf-8')
+            ## Memory error...
+            #frame2 = pd.read_csv('data/all_dga2.txt', names=['raw_domain'], header=None, encoding='utf-8')
+            dga_dataframe = dga_dataframe.append(frame2, ignore_index=True)
+    
+            # We noticed that the blacklist values just differ by captilization or .com/.org/.info
+            dga_dataframe['domain'] = dga_dataframe.applymap(lambda x: x.split('.')[0].strip().lower())
+            del dga_dataframe['raw_domain']
+    
+            # It's possible we have NaNs from blanklines or whatever
+            dga_dataframe = dga_dataframe.dropna()
+            dga_dataframe = dga_dataframe.drop_duplicates()
+            dga_total = dga_dataframe.shape[0]
+            print 'Total DGA domains %d' % dga_total
+    
+            # Set the class
+            dga_dataframe['class'] = 'dga'
+    
+            print 'Number of DGA domains: %d' % dga_dataframe.shape[0]
+            print dga_dataframe.head()
+    
+    
+            # Concatenate the domains in a big pile!
+            all_domains = pd.concat([alexa_dataframe, dga_dataframe], ignore_index=True)
+    
+            # Add a length field for the domain
+            all_domains['length'] = [len(x) for x in all_domains['domain']]
+    
+            # Okay since we're trying to detect dynamically generated domains and short
+            # domains (length <=6) are crazy random even for 'legit' domains we're going
+            # to punt on short domains (perhaps just white/black list for short domains?)
+            all_domains = all_domains[all_domains['length'] > 6]
+    
+            # Add a entropy field for the domain
+            all_domains['entropy'] = [entropy(x) for x in all_domains['domain']]
+            print all_domains.head()
+    
+    
+            # Now we compute NGrams for every Alexa domain and see if we can use the
+            # NGrams to help us better differentiate and mark DGA domains...
+    
+            # Scikit learn has a nice NGram generator that can generate either char NGrams or word NGrams (we're using char).
+            # Parameters:
+            #       - ngram_range=(3,5)  # Give me all ngrams of length 3, 4, and 5
+            #       - min_df=1e-4        # Minimumum document frequency. At 1e-4 we're saying give us NGrams that
+            #                            # happen in at least .1% of the domains (so for 100k... at least 100 domains)
+            alexa_vc = sklearn.feature_extraction.text.CountVectorizer(analyzer='char', ngram_range=(3,5), min_df=1e-4, max_df=1.0)
+    
+            # I'm SURE there's a better way to store all the counts but not sure...
+            # At least the min_df parameters has already done some thresholding
+            counts_matrix = alexa_vc.fit_transform(alexa_dataframe['domain'])
+            alexa_counts = np.log10(counts_matrix.sum(axis=0).getA1())
+            ngrams_list = alexa_vc.get_feature_names()
+    
+            # For fun sort it and show it
+            import operator
+            _sorted_ngrams = sorted(zip(ngrams_list, alexa_counts), key=operator.itemgetter(1), reverse=True)
+            print 'Alexa NGrams: %d' % len(_sorted_ngrams)
+            for ngram, count in _sorted_ngrams[:10]:
+                print ngram, count
+    
+    
+            # We're also going to throw in a bunch of dictionary words
+            word_dataframe = pd.read_csv('data/words.txt', names=['word'], header=None, dtype={'word': np.str}, encoding='utf-8')
+    
+            # Cleanup words from dictionary
+            word_dataframe = word_dataframe[word_dataframe['word'].map(lambda x: str(x).isalpha())]
+            word_dataframe = word_dataframe.applymap(lambda x: str(x).strip().lower())
+            word_dataframe = word_dataframe.dropna()
+            word_dataframe = word_dataframe.drop_duplicates()
+            print word_dataframe.head(10)
+    
+    
+            # Now compute NGrams on the dictionary words
+            # Same logic as above...
+            dict_vc = sklearn.feature_extraction.text.CountVectorizer(analyzer='char', ngram_range=(3,5), min_df=1e-5, max_df=1.0)
+            counts_matrix = dict_vc.fit_transform(word_dataframe['word'])
+            dict_counts = np.log10(counts_matrix.sum(axis=0).getA1())
+            ngrams_list = dict_vc.get_feature_names()
+    
+    
+            # For fun sort it and show it
+            import operator
+            _sorted_ngrams = sorted(zip(ngrams_list, dict_counts), key=operator.itemgetter(1), reverse=True)
+            print 'Word NGrams: %d' % len(_sorted_ngrams)
+            for ngram, count in _sorted_ngrams[:10]:
+                print ngram, count
+    
+    
+            # We use the transform method of the CountVectorizer to form a vector
+            # of ngrams contained in the domain, that vector is than multiplied
+            # by the counts vector (which is a column sum of the count matrix).
+            def ngram_count(domain):
+                alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot vector multiply and transpose Woo Hoo!
+                dict_match = dict_counts * dict_vc.transform([domain]).T
+                print '%s Alexa match:%d Dict match: %d' % (domain, alexa_match, dict_match)
+    
+            # Examples:
+            ngram_count('google')
+            ngram_count('facebook')
+            ngram_count('1cb8a5f36f')
+            ngram_count('pterodactylfarts')
+            ngram_count('ptes9dro-dwacty2lfa5rrts')
+            ngram_count('beyonce')
+            ngram_count('bey666on4ce')
+    
+            # Compute NGram matches for all the domains and add to our dataframe
+            all_domains['alexa_grams']= alexa_counts * alexa_vc.transform(all_domains['domain']).T
+            all_domains['word_grams']= dict_counts * dict_vc.transform(all_domains['domain']).T
+            print all_domains.head()
+    
+    
+            # Use the vectorized operations of the dataframe to investigate differences
+            # between the alexa and word grams
+            all_domains['diff'] = all_domains['alexa_grams'] - all_domains['word_grams']
+    
+            # The table below shows those domain names that are more 'dictionary' and less 'web'
+            print all_domains.sort(['diff'], ascending=True).head(10)
+    
+            # The table below shows those domain names that are more 'web' and less 'dictionary'
+            # Good O' web....
+            print all_domains.sort(['diff'], ascending=False).head(50)
+    
+            # Lets look at which Legit domains are scoring low on both alexa and word gram count
+            weird_cond = (all_domains['class']=='legit') & (all_domains['word_grams']<3) & (all_domains['alexa_grams']<2)
+            weird = all_domains[weird_cond]
+            print weird.shape[0]
+            print weird.head(10)
+    
+            # Epiphany... Alexa really may not be the best 'exemplar' set...
+            #             (probably a no-shit moment for everyone else :)
+            #
+            # Discussion: If you're using these as exemplars of NOT DGA, then your probably
+            #             making things very hard on your machine learning algorithm.
+            #             Perhaps we should have two categories of Alexa domains, 'legit'
+            #             and a 'weird'. based on some definition of weird.
+            #             Looking at the entries above... we have approx 80 domains
+            #             that we're going to mark as 'weird'.
+            #
+            all_domains.loc[weird_cond, 'class'] = 'weird'
+            print all_domains['class'].value_counts()
+            all_domains[all_domains['class'] == 'weird'].head()
+    
+    
+            # Perhaps we will just exclude the weird class from our ML training
+            not_weird = all_domains[all_domains['class'] != 'weird']
+            X = not_weird.as_matrix(['length', 'entropy', 'alexa_grams', 'word_grams'])
+    
+            # Labels (scikit learn uses 'y' for classification labels)
+            y = np.array(not_weird['class'].tolist())
+    
+    
+            # Random Forest is a popular ensemble machine learning classifier.
+            # http://scikit-learn.org/dev/modules/generated/sklearn.ensemble.RandomForestClassifier.html
+            clf = sklearn.ensemble.RandomForestClassifier(n_estimators=20) # Trees in the forest
+    
+    
+            # Train on a 80/20 split
+            from sklearn.cross_validation import train_test_split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+    
+            # Now plot the results of the holdout set in a confusion matrix
+            labels = ['legit', 'dga']
+            cm = sklearn.metrics.confusion_matrix(y_test, y_pred, labels)
+            show_cm(cm, labels)
+    
+            # We can also look at what features the learning algorithm thought were the most important
+            importances = zip(['length', 'entropy', 'alexa_grams', 'word_grams'], clf.feature_importances_)
+            print importances
+    
+            # Now train on the whole thing before doing tests and saving models to disk
+            clf.fit(X, y)
+    
+            # Serialize model to disk
+            if not os.path.isfile("models/dga_model_random_forest.model"):
+                save_model_to_disk('dga_model_random_forest', clf)
+                save_model_to_disk('dga_model_alexa_vectorizor', alexa_vc)
+                save_model_to_disk('dga_model_alexa_counts', alexa_counts)
+                save_model_to_disk('dga_model_dict_vectorizor', dict_vc)
+                save_model_to_disk('dga_model_dict_counts', dict_counts)
 
-    # Handle command-line arguments
-    parser = optparse.OptionParser()
-    parser.add_option('--alexa-file', default='data/alexa_100k.csv', help='Alexa file to pull from.  Default: %default')
-    (options, arguments) = parser.parse_args()
-    print options, arguments
-
-
-    try: # Pokemon exception handling
-
-        # This is the Alexa 1M domain list.
-        print 'Loading alexa dataframe...'
-        alexa_dataframe = pd.read_csv(options.alexa_file, names=['rank','uri'], header=None, encoding='utf-8')
-        print alexa_dataframe.info()
-        print alexa_dataframe.head()
-
-        # Compute the 2LD of the domain given by Alexa
-        alexa_dataframe['domain'] = [ domain_extract(uri) for uri in alexa_dataframe['uri']]
-        del alexa_dataframe['rank']
-        del alexa_dataframe['uri']
-        alexa_dataframe = alexa_dataframe.dropna()
-        alexa_dataframe = alexa_dataframe.drop_duplicates()
-        print alexa_dataframe.head()
-
-        # Set the class
-        alexa_dataframe['class'] = 'legit'
-
-        # Shuffle the data (important for training/testing)
-        alexa_dataframe = alexa_dataframe.reindex(np.random.permutation(alexa_dataframe.index))
-        alexa_total = alexa_dataframe.shape[0]
-        print 'Total Alexa domains %d' % alexa_total
-
-
-        # Read in the DGA domains
-        dga_dataframe = pd.read_csv('data/dga_domains.txt', names=['raw_domain'], header=None, encoding='utf-8')
-
-        # We noticed that the blacklist values just differ by captilization or .com/.org/.info
-        dga_dataframe['domain'] = dga_dataframe.applymap(lambda x: x.split('.')[0].strip().lower())
-        del dga_dataframe['raw_domain']
-
-        # It's possible we have NaNs from blanklines or whatever
-        dga_dataframe = dga_dataframe.dropna()
-        dga_dataframe = dga_dataframe.drop_duplicates()
-        dga_total = dga_dataframe.shape[0]
-        print 'Total DGA domains %d' % dga_total
-
-        # Set the class
-        dga_dataframe['class'] = 'dga'
-
-        print 'Number of DGA domains: %d' % dga_dataframe.shape[0]
-        print dga_dataframe.head()
-
-
-        # Concatenate the domains in a big pile!
-        all_domains = pd.concat([alexa_dataframe, dga_dataframe], ignore_index=True)
-
-        # Add a length field for the domain
-        all_domains['length'] = [len(x) for x in all_domains['domain']]
-
-        # Okay since we're trying to detect dynamically generated domains and short
-        # domains (length <=6) are crazy random even for 'legit' domains we're going
-        # to punt on short domains (perhaps just white/black list for short domains?)
-        all_domains = all_domains[all_domains['length'] > 6]
-
-        # Add a entropy field for the domain
-        all_domains['entropy'] = [entropy(x) for x in all_domains['domain']]
-        print all_domains.head()
-
-
-        # Now we compute NGrams for every Alexa domain and see if we can use the
-        # NGrams to help us better differentiate and mark DGA domains...
-
-        # Scikit learn has a nice NGram generator that can generate either char NGrams or word NGrams (we're using char).
-        # Parameters:
-        #       - ngram_range=(3,5)  # Give me all ngrams of length 3, 4, and 5
-        #       - min_df=1e-4        # Minimumum document frequency. At 1e-4 we're saying give us NGrams that
-        #                            # happen in at least .1% of the domains (so for 100k... at least 100 domains)
-        alexa_vc = sklearn.feature_extraction.text.CountVectorizer(analyzer='char', ngram_range=(3,5), min_df=1e-4, max_df=1.0)
-
-        # I'm SURE there's a better way to store all the counts but not sure...
-        # At least the min_df parameters has already done some thresholding
-        counts_matrix = alexa_vc.fit_transform(alexa_dataframe['domain'])
-        alexa_counts = np.log10(counts_matrix.sum(axis=0).getA1())
-        ngrams_list = alexa_vc.get_feature_names()
-
-        # For fun sort it and show it
-        import operator
-        _sorted_ngrams = sorted(zip(ngrams_list, alexa_counts), key=operator.itemgetter(1), reverse=True)
-        print 'Alexa NGrams: %d' % len(_sorted_ngrams)
-        for ngram, count in _sorted_ngrams[:10]:
-            print ngram, count
-
-
-        # We're also going to throw in a bunch of dictionary words
-        word_dataframe = pd.read_csv('data/words.txt', names=['word'], header=None, dtype={'word': np.str}, encoding='utf-8')
-
-        # Cleanup words from dictionary
-        word_dataframe = word_dataframe[word_dataframe['word'].map(lambda x: str(x).isalpha())]
-        word_dataframe = word_dataframe.applymap(lambda x: str(x).strip().lower())
-        word_dataframe = word_dataframe.dropna()
-        word_dataframe = word_dataframe.drop_duplicates()
-        print word_dataframe.head(10)
-
-
-        # Now compute NGrams on the dictionary words
-        # Same logic as above...
-        dict_vc = sklearn.feature_extraction.text.CountVectorizer(analyzer='char', ngram_range=(3,5), min_df=1e-5, max_df=1.0)
-        counts_matrix = dict_vc.fit_transform(word_dataframe['word'])
-        dict_counts = np.log10(counts_matrix.sum(axis=0).getA1())
-        ngrams_list = dict_vc.get_feature_names()
-
-
-        # For fun sort it and show it
-        import operator
-        _sorted_ngrams = sorted(zip(ngrams_list, dict_counts), key=operator.itemgetter(1), reverse=True)
-        print 'Word NGrams: %d' % len(_sorted_ngrams)
-        for ngram, count in _sorted_ngrams[:10]:
-            print ngram, count
-
-
-        # We use the transform method of the CountVectorizer to form a vector
-        # of ngrams contained in the domain, that vector is than multiplied
-        # by the counts vector (which is a column sum of the count matrix).
-        def ngram_count(domain):
-            alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot vector multiply and transpose Woo Hoo!
-            dict_match = dict_counts * dict_vc.transform([domain]).T
-            print '%s Alexa match:%d Dict match: %d' % (domain, alexa_match, dict_match)
-
-        # Examples:
-        ngram_count('google')
-        ngram_count('facebook')
-        ngram_count('1cb8a5f36f')
-        ngram_count('pterodactylfarts')
-        ngram_count('ptes9dro-dwacty2lfa5rrts')
-        ngram_count('beyonce')
-        ngram_count('bey666on4ce')
-
-        # Compute NGram matches for all the domains and add to our dataframe
-        all_domains['alexa_grams']= alexa_counts * alexa_vc.transform(all_domains['domain']).T
-        all_domains['word_grams']= dict_counts * dict_vc.transform(all_domains['domain']).T
-        print all_domains.head()
-
-
-        # Use the vectorized operations of the dataframe to investigate differences
-        # between the alexa and word grams
-        all_domains['diff'] = all_domains['alexa_grams'] - all_domains['word_grams']
-
-        # The table below shows those domain names that are more 'dictionary' and less 'web'
-        print all_domains.sort(['diff'], ascending=True).head(10)
-
-        # The table below shows those domain names that are more 'web' and less 'dictionary'
-        # Good O' web....
-        print all_domains.sort(['diff'], ascending=False).head(50)
-
-        # Lets look at which Legit domains are scoring low on both alexa and word gram count
-        weird_cond = (all_domains['class']=='legit') & (all_domains['word_grams']<3) & (all_domains['alexa_grams']<2)
-        weird = all_domains[weird_cond]
-        print weird.shape[0]
-        print weird.head(10)
-
-        # Epiphany... Alexa really may not be the best 'exemplar' set...
-        #             (probably a no-shit moment for everyone else :)
-        #
-        # Discussion: If you're using these as exemplars of NOT DGA, then your probably
-        #             making things very hard on your machine learning algorithm.
-        #             Perhaps we should have two categories of Alexa domains, 'legit'
-        #             and a 'weird'. based on some definition of weird.
-        #             Looking at the entries above... we have approx 80 domains
-        #             that we're going to mark as 'weird'.
-        #
-        all_domains.loc[weird_cond, 'class'] = 'weird'
-        print all_domains['class'].value_counts()
-        all_domains[all_domains['class'] == 'weird'].head()
-
-
-        # Perhaps we will just exclude the weird class from our ML training
-        not_weird = all_domains[all_domains['class'] != 'weird']
-        X = not_weird.as_matrix(['length', 'entropy', 'alexa_grams', 'word_grams'])
-
-        # Labels (scikit learn uses 'y' for classification labels)
-        y = np.array(not_weird['class'].tolist())
-
-
-        # Random Forest is a popular ensemble machine learning classifier.
-        # http://scikit-learn.org/dev/modules/generated/sklearn.ensemble.RandomForestClassifier.html
-        clf = sklearn.ensemble.RandomForestClassifier(n_estimators=20, compute_importances=True) # Trees in the forest
-
-
-        # Train on a 80/20 split
-        from sklearn.cross_validation import train_test_split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-
-        # Now plot the results of the holdout set in a confusion matrix
-        labels = ['legit', 'dga']
-        cm = sklearn.metrics.confusion_matrix(y_test, y_pred, labels)
-        show_cm(cm, labels)
-
-        # We can also look at what features the learning algorithm thought were the most important
-        importances = zip(['length', 'entropy', 'alexa_grams', 'word_grams'], clf.feature_importances_)
-        print importances
-
-        # Now train on the whole thing before doing tests and saving models to disk
-        clf.fit(X, y)
-
-        # test_it shows how to do evaluation, also fun for manual testing below :)
-        def test_it(domain):
-
-            _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
-            _dict_match = dict_counts * dict_vc.transform([domain]).T
-            _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
-            print '%s : %s' % (domain, clf.predict(_X)[0])
-
-
-        # Examples (feel free to change these and see the results!)
-        test_it('google')
-        test_it('google88')
-        test_it('facebook')
-        test_it('1cb8a5f36f')
-        test_it('pterodactylfarts')
-        test_it('ptes9dro-dwacty2lfa5rrts')
-        test_it('beyonce')
-        test_it('bey666on4ce')
-        test_it('supersexy')
-        test_it('yourmomissohotinthesummertime')
-        test_it('35-sdf-09jq43r')
-        test_it('clicksecurity')
-
-
-        # Serialize model to disk
-        save_model_to_disk('dga_model_random_forest', clf)
-        save_model_to_disk('dga_model_alexa_vectorizor', alexa_vc)
-        save_model_to_disk('dga_model_alexa_counts', alexa_counts)
-        save_model_to_disk('dga_model_dict_vectorizor', dict_vc)
-        save_model_to_disk('dga_model_dict_counts', dict_counts)
-
+        return (clf, alexa_vc, alexa_counts, dict_vc, dict_counts)
 
     except KeyboardInterrupt:
         print 'Goodbye Cruel World...'
@@ -331,5 +333,124 @@ def main():
         print '(Exception):, %s' % (str(error))
         sys.exit(1)
 
+# test_it shows how to do evaluation, also fun for manual testing below :)
+def test_it(domain):
+        global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+
+        _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
+        _dict_match = dict_counts * dict_vc.transform([domain]).T
+        _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
+        #print '%s : %s' % (domain, clf.predict(_X)[0])
+        return (domain, clf.predict(_X)[0])
+
+def main():
+
+    ''' Main method, takes care of loading data, running it through the various analyses
+        and reporting the results
+    '''
+
+    # Handle command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Query DGA Qualification',
+        usage='%(prog)s [options]'
+        )
+    parser.add_argument('-o', '--output', default='txt',
+        help="Specify output type: TXT (default), CSV or CEF")
+    parser.add_argument('argstring', metavar='STR', type=str, nargs='?',
+        help='a domain or a file containing domains')
+    possible_types = [ 'txt', 'csv', 'cef' ]
+    parser.add_argument('-a', '--alexa-file', default='data/alexa_100k.csv', 
+        dest='alexa_file',
+        help='Alexa file to pull from.  Default: %default')
+    parser.add_argument('-t', '--test', action="store_true", dest='test',
+        help="Executes example tests")
+    parser.add_argument("-v", action="store_true", dest="verbose")
+    args = parser.parse_args()
+
+    if args.output.lower() not in possible_types:
+        sys.exit('Invalid file type specified. Possible types are: %s' % possible_types)
+
+    if args.verbose:
+        # Version printing is always a good idea
+        print 'Scikit Learn version: %s' % sklearn.__version__
+        print 'Pandas version: %s' % pd.__version__
+        print 'TLDExtract version: %s' % tldextract.__version__
+
+    (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(args)
+
+    def test_examples(output='txt'):
+        # Examples (feel free to change these and see the results!)
+        formatout(test_it('google'), output)
+        formatout(test_it('google88'), output)
+        formatout(test_it('facebook'), output)
+        formatout(test_it('1cb8a5f36f'), output)
+        formatout(test_it('pterodactylfarts'), output)
+        formatout(test_it('ptes9dro-dwacty2lfa5rrts'), output)
+        formatout(test_it('beyonce'), output)
+        formatout(test_it('bey666on4ce'), output)
+        formatout(test_it('supersexy'), output)
+        formatout(test_it('yourmomissohotinthesummertime'), output)
+        formatout(test_it('35-sdf-09jq43r'), output)
+        formatout(test_it('clicksecurity'), output)
+## http://researchcenter.paloaltonetworks.com/2014/10/rovnix-declaration-generation-algorithm/
+        formatout(test_it('kingwhichtotallyadminis'), output)
+        formatout(test_it('thareplunjudiciary'), output)
+        formatout(test_it('townsunalienable'), output)
+        formatout(test_it('taxeslawsmockhigh'), output)
+        formatout(test_it('transientperfidythe'), output)
+        formatout(test_it('inhabitantslaindourmock'), output)
+        formatout(test_it('thworldthesuffer'), output)
+## https://github.com/Andrewaeva/DGA
+        formatout(test_it('stabletiredflowerwardisappointed'), output)
+        formatout(test_it('suitshelterplateservefloor'), output)
+        formatout(test_it('viewjacketplacebridgeprint'), output)
+        formatout(test_it('homesharppauseincreaseaddress'), output)
+        formatout(test_it('blackridestayhitlackpound'), output)
+
+    def formatout(inputdata, outputtype):
+        if outputtype == 'txt':
+            print '%s : %s' % (inputdata[0], inputdata[1])
+        elif outputtype == 'csv':
+            print '%s;%s' % (inputdata[0], inputdata[1])
+        elif outputtype == 'cef' and inputdata[1] == 'dga':
+            print 'CEF:0|Data_hacking/dga_detection|API|1.0|10000|Possible DGA match on %s' % (inputdata[0])
+        elif outputtype == 'cef' and inputdata[1] != 'dga':
+            return
+        else:
+            print "Error! unrecognized scheme " + outputtype
+
+    if args.test:
+        test_examples(args.output)
+    else:
+        try:
+            out = test_it(args.argstring)
+            formatout(out, args.output)
+        except:
+            for line in sys.stdin:
+                out = test_it(line.strip())
+                formatout(out, args.output)
+
+## to be use as module
+def dga_detection(fqdn):
+    global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+    global whitelist_domain_re
+
+    ## domain and subdomain extract, qualification, result
+    try:
+        ext = tldextract.extract(uri)
+        ## few exclusion, http://www.cert.pl/news/9887/langswitch_lang/en
+        if len(str(ext.domain)) <= 6 or whitelist_domain_re.match(fqdn):
+            return 'legit'
+        (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init()
+        Dom = test_it(ext.domain)
+        SDom = test_it(ext.subdomain)
+        if Dom[1] == SDom[1]:
+            return Dom[1]
+        else:
+            return 'Undetermined'
+    except Exception, e:
+        return "Error " + str(e)
+
 if __name__ == '__main__':
     main()
+
