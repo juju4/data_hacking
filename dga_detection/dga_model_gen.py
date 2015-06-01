@@ -90,20 +90,28 @@ def load_model_from_disk(name, model_dir='models'):
 
     return model
 
-def init(args=None):
+def init(args=None, modeldir='models', alexafile='data/alexa_100k.csv'):
     global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+
+    if args is not None:
+        modeldir = args.modeldir
+        alexafile = args.alexa_file
+        verbose = args.verbose
+    else:
+        verbose = 0
+
     try: 
         #try:
-        if os.path.isfile("models/dga_model_random_forest.model"):
+        if os.path.isfile(modeldir + "/dga_model_random_forest.model"):
             # Load model from disk
-            if args.verbose:
+            if verbose:
                 print 'Loading model from disk'
-            clf = load_model_from_disk('dga_model_random_forest')
-            alexa_vc = load_model_from_disk('dga_model_alexa_vectorizor')
-            alexa_counts = load_model_from_disk('dga_model_alexa_counts')
-            dict_vc = load_model_from_disk('dga_model_dict_vectorizor')
-            dict_counts = load_model_from_disk('dga_model_dict_counts')
-            if args.verbose:
+            clf = load_model_from_disk('dga_model_random_forest', modeldir)
+            alexa_vc = load_model_from_disk('dga_model_alexa_vectorizor', modeldir)
+            alexa_counts = load_model_from_disk('dga_model_alexa_counts', modeldir)
+            dict_vc = load_model_from_disk('dga_model_dict_vectorizor', modeldir)
+            dict_counts = load_model_from_disk('dga_model_dict_counts', modeldir)
+            if verbose:
                 print 'Loading ended'
 
         #except:
@@ -112,10 +120,6 @@ def init(args=None):
     
             # This is the Alexa 1M domain list.
             print 'Loading alexa dataframe...'
-            try:
-                alexa_file = args.alexa_file
-            except:
-                alexa_file = 'data/alexa_100k.csv'
             alexa_dataframe = pd.read_csv(alexa_file, names=['rank','uri'], header=None, encoding='utf-8')
             print alexa_dataframe.info()
             print alexa_dataframe.head()
@@ -316,12 +320,12 @@ def init(args=None):
             clf.fit(X, y)
     
             # Serialize model to disk
-            if not os.path.isfile("models/dga_model_random_forest.model"):
-                save_model_to_disk('dga_model_random_forest', clf)
-                save_model_to_disk('dga_model_alexa_vectorizor', alexa_vc)
-                save_model_to_disk('dga_model_alexa_counts', alexa_counts)
-                save_model_to_disk('dga_model_dict_vectorizor', dict_vc)
-                save_model_to_disk('dga_model_dict_counts', dict_counts)
+            if not os.path.isfile(modeldir + "dga_model_random_forest.model"):
+                save_model_to_disk('dga_model_random_forest', clf, modeldir)
+                save_model_to_disk('dga_model_alexa_vectorizor', alexa_vc, modeldir)
+                save_model_to_disk('dga_model_alexa_counts', alexa_counts, modeldir)
+                save_model_to_disk('dga_model_dict_vectorizor', dict_vc, modeldir)
+                save_model_to_disk('dga_model_dict_counts', dict_counts, modeldir)
 
         return (clf, alexa_vc, alexa_counts, dict_vc, dict_counts)
 
@@ -352,7 +356,7 @@ def main():
     # Handle command-line arguments
     parser = argparse.ArgumentParser(
         description='Query DGA Qualification',
-        usage='%(prog)s [options]'
+        usage='%(prog)s [options]\n\npython ~/data_hacking/dga_detection/dga_model_gen.py -v -t -a ~/data_hacking/dga_detection/data/alexa_100k.csv -m ~/data_hacking/dga_detection/models'
         )
     parser.add_argument('-o', '--output', default='txt',
         help="Specify output type: TXT (default), CSV or CEF")
@@ -362,6 +366,9 @@ def main():
     parser.add_argument('-a', '--alexa-file', default='data/alexa_100k.csv', 
         dest='alexa_file',
         help='Alexa file to pull from.  Default: %default')
+    parser.add_argument('-m', '--model-dir', default='models', 
+        dest='modeldir',
+        help='Model dir path to serialize initial model.  Default: %default')
     parser.add_argument('-t', '--test', action="store_true", dest='test',
         help="Executes example tests")
     parser.add_argument("-v", action="store_true", dest="verbose")
@@ -375,6 +382,7 @@ def main():
         print 'Scikit Learn version: %s' % sklearn.__version__
         print 'Pandas version: %s' % pd.__version__
         print 'TLDExtract version: %s' % tldextract.__version__
+        print args
 
     (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(args)
 
@@ -431,17 +439,17 @@ def main():
                 formatout(out, args.output)
 
 ## to be use as module
-def dga_detection(fqdn):
+def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/models', alexafile = '/home/vagrant/data_hacking/dga_detection/data/alexa_100k.csv'):
     global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
     global whitelist_domain_re
 
     ## domain and subdomain extract, qualification, result
     try:
-        ext = tldextract.extract(uri)
+        ext = tldextract.extract(fqdn)
         ## few exclusion, http://www.cert.pl/news/9887/langswitch_lang/en
         if len(str(ext.domain)) <= 6 or whitelist_domain_re.match(fqdn):
             return 'legit'
-        (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init()
+        (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, modeldir, alexafile)
         Dom = test_it(ext.domain)
         SDom = test_it(ext.subdomain)
         if Dom[1] == SDom[1]:
