@@ -90,15 +90,21 @@ def load_model_from_disk(name, model_dir='models'):
 
     return model
 
-def init(args=None, modeldir='models', alexafile='data/alexa_100k.csv'):
+def init(args=None, modeldir='models', alexa_file='data/alexa_100k.csv', rootdir = ''):
     global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
 
     if args is not None:
         modeldir = args.modeldir
-        alexafile = args.alexa_file
+        alexa_file = args.alexa_file
         verbose = args.verbose
+	rootdir = args.rootdir
     else:
         verbose = 0
+    if rootdir:
+        modeldir = rootdir + '/'
+        alexa_file = rootdir + '/' + alexa_file
+	rootdir = rootdir + '/'
+
 
     try: 
         #try:
@@ -142,9 +148,9 @@ def init(args=None, modeldir='models', alexafile='data/alexa_100k.csv'):
     
     
             # Read in the DGA domains
-            dga_dataframe = pd.read_csv('data/dga_domains.txt', names=['raw_domain'], header=None, encoding='utf-8')
+            dga_dataframe = pd.read_csv(rootdir + 'data/dga_domains.txt', names=['raw_domain'], header=None, encoding='utf-8')
             ## https://raw.githubusercontent.com/Andrewaeva/DGA/
-            frame2 = pd.read_csv('data/matsnu.txt', names=['raw_domain'], header=None, encoding='utf-8')
+            frame2 = pd.read_csv(rootdir + 'data/matsnu.txt', names=['raw_domain'], header=None, encoding='utf-8')
             ## Memory error...
             #frame2 = pd.read_csv('data/all_dga2.txt', names=['raw_domain'], header=None, encoding='utf-8')
             dga_dataframe = dga_dataframe.append(frame2, ignore_index=True)
@@ -207,7 +213,7 @@ def init(args=None, modeldir='models', alexafile='data/alexa_100k.csv'):
     
     
             # We're also going to throw in a bunch of dictionary words
-            word_dataframe = pd.read_csv('data/words.txt', names=['word'], header=None, dtype={'word': np.str}, encoding='utf-8')
+            word_dataframe = pd.read_csv(rootdir + 'data/words.txt', names=['word'], header=None, dtype={'word': np.str}, encoding='utf-8')
     
             # Cleanup words from dictionary
             word_dataframe = word_dataframe[word_dataframe['word'].map(lambda x: str(x).isalpha())]
@@ -339,13 +345,18 @@ def init(args=None, modeldir='models', alexafile='data/alexa_100k.csv'):
 
 # test_it shows how to do evaluation, also fun for manual testing below :)
 def test_it(domain):
-        global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+	try:
+		import netaddr
+		ip = netaddr.IPAddress(domain)
+		return (domain, 'legit')
+    	except Exception, e:
+        	global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
 
-        _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
-        _dict_match = dict_counts * dict_vc.transform([domain]).T
-        _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
-        #print '%s : %s' % (domain, clf.predict(_X)[0])
-        return (domain, clf.predict(_X)[0])
+	        _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
+        	_dict_match = dict_counts * dict_vc.transform([domain]).T
+	        _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
+        	#print '%s : %s' % (domain, clf.predict(_X)[0])
+	        return (domain, clf.predict(_X)[0])
 
 def main():
 
@@ -369,6 +380,9 @@ def main():
     parser.add_argument('-m', '--model-dir', default='models', 
         dest='modeldir',
         help='Model dir path to serialize initial model.  Default: %default')
+    parser.add_argument('-r', '--rootdir', default='', 
+        dest='rootdir',
+        help='Repository rootdir absolute path.  Default: %default')
     parser.add_argument('-t', '--test', action="store_true", dest='test',
         help="Executes example tests")
     parser.add_argument("-v", action="store_true", dest="verbose")
@@ -414,6 +428,7 @@ def main():
         formatout(test_it('viewjacketplacebridgeprint'), output)
         formatout(test_it('homesharppauseincreaseaddress'), output)
         formatout(test_it('blackridestayhitlackpound'), output)
+        formatout(test_it('192.168.1.1'), output)
 
     def formatout(inputdata, outputtype):
         if outputtype == 'txt':
@@ -439,7 +454,7 @@ def main():
                 formatout(out, args.output)
 
 ## to be use as module
-def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/models', alexafile = '/home/vagrant/data_hacking/dga_detection/data/alexa_100k.csv'):
+def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/models', alexafile = '/home/vagrant/data_hacking/dga_detection/data/alexa_100k.csv', rootdir = '/home/vagrant/data_hacking'):
     global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
     global whitelist_domain_re
 
@@ -449,13 +464,19 @@ def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/mod
         ## few exclusion, http://www.cert.pl/news/9887/langswitch_lang/en
         if len(str(ext.domain)) <= 6 or whitelist_domain_re.match(fqdn):
             return 'legit'
-        (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, modeldir, alexafile)
-        Dom = test_it(ext.domain)
-        SDom = test_it(ext.subdomain)
-        if Dom[1] == SDom[1]:
-            return Dom[1]
-        else:
-            return 'Undetermined'
+	## check if IPaddr
+	try:
+		import netaddr
+		ip = netaddr.IPAddress(fqdn)
+		return 'legit'
+	except:
+        	(clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, modeldir, alexafile)
+	        Dom = test_it(ext.domain)
+        	SDom = test_it(ext.subdomain)
+	        if Dom[1] == SDom[1]:
+        	    return Dom[1]
+	        else:
+        	    return 'Undetermined'
     except Exception, e:
         return "Error " + str(e)
 
