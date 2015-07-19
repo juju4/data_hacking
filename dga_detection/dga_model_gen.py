@@ -97,13 +97,15 @@ def init(args=None, modeldir='models', alexa_file='data/alexa_100k.csv', rootdir
         modeldir = args.modeldir
         alexa_file = args.alexa_file
         verbose = args.verbose
-	rootdir = args.rootdir
+        rootdir = args.rootdir
     else:
         verbose = 0
-    if rootdir:
+    if rootdir and not modeldir:
         modeldir = rootdir + '/'
+    if rootdir and not alexa_file:
         alexa_file = rootdir + '/' + alexa_file
-	rootdir = rootdir + '/'
+    if rootdir:
+        rootdir = rootdir + '/'
 
 
     try: 
@@ -345,18 +347,18 @@ def init(args=None, modeldir='models', alexa_file='data/alexa_100k.csv', rootdir
 
 # test_it shows how to do evaluation, also fun for manual testing below :)
 def test_it(domain):
-	try:
-		import netaddr
-		ip = netaddr.IPAddress(domain)
-		return (domain, 'legit')
-    	except Exception, e:
-        	global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
+    try:
+        import netaddr
+        ip = netaddr.IPAddress(domain)
+        return (domain, 'legit')
+    except Exception, e:
+        global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
 
-	        _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
-        	_dict_match = dict_counts * dict_vc.transform([domain]).T
-	        _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
-        	#print '%s : %s' % (domain, clf.predict(_X)[0])
-	        return (domain, clf.predict(_X)[0])
+        _alexa_match = alexa_counts * alexa_vc.transform([domain]).T  # Woot matrix multiply and transpose Woo Hoo!
+        _dict_match = dict_counts * dict_vc.transform([domain]).T
+        _X = [len(domain), entropy(domain), _alexa_match, _dict_match]
+        #print '%s : %s' % (domain, clf.predict(_X)[0])
+        return (domain, clf.predict(_X)[0])
 
 def main():
 
@@ -454,7 +456,7 @@ def main():
                 formatout(out, args.output)
 
 ## to be use as module
-def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/models', alexafile = '/home/vagrant/data_hacking/dga_detection/data/alexa_100k.csv', rootdir = '/home/vagrant/data_hacking'):
+def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/models', alexafile = '/home/vagrant/data_hacking/dga_detection/data/alexa_100k.csv', rootdir = '/home/vagrant/data_hacking/dga_detection'):
     global clf, alexa_vc, alexa_counts, dict_vc, dict_counts
     global whitelist_domain_re
 
@@ -464,19 +466,19 @@ def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/mod
         ## few exclusion, http://www.cert.pl/news/9887/langswitch_lang/en
         if len(str(ext.domain)) <= 6 or whitelist_domain_re.match(fqdn):
             return 'legit'
-	## check if IPaddr
-	try:
-		import netaddr
-		ip = netaddr.IPAddress(fqdn)
-		return 'legit'
-	except:
-        	(clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, modeldir, alexafile)
-	        Dom = test_it(ext.domain)
-        	SDom = test_it(ext.subdomain)
-	        if Dom[1] == SDom[1]:
-        	    return Dom[1]
-	        else:
-        	    return 'Undetermined'
+    ## check if IPaddr
+    try:
+        import netaddr
+        ip = netaddr.IPAddress(fqdn)
+        return 'legit'
+    except:
+            (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, rootdir=rootdir)
+            Dom = test_it(ext.domain)
+            SDom = test_it(ext.subdomain)
+            if Dom[1] == SDom[1]:
+                return Dom[1]
+            else:
+                return 'Undetermined'
     except Exception, e:
         return "Error " + str(e)
 
