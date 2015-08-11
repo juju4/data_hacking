@@ -466,19 +466,19 @@ def dga_detection(fqdn, modeldir = '/home/vagrant/data_hacking/dga_detection/mod
         ## few exclusion, http://www.cert.pl/news/9887/langswitch_lang/en
         if len(str(ext.domain)) <= 6 or whitelist_domain_re.match(fqdn):
             return 'legit'
-    ## check if IPaddr
-    try:
-        import netaddr
-        ip = netaddr.IPAddress(fqdn)
-        return 'legit'
-    except:
-            (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, rootdir=rootdir)
-            Dom = test_it(ext.domain)
-            SDom = test_it(ext.subdomain)
-            if Dom[1] == SDom[1]:
-                return Dom[1]
-            else:
-                return 'Undetermined'
+        ## check if IPaddr
+        try:
+            import netaddr
+            ip = netaddr.IPAddress(fqdn)
+            return 'legit'
+        except:
+                (clf, alexa_vc, alexa_counts, dict_vc, dict_counts) = init(None, rootdir=rootdir)
+                Dom = test_it(ext.domain)
+                SDom = test_it(ext.subdomain)
+                if Dom[1] == SDom[1]:
+                    return Dom[1]
+                else:
+                    return 'Undetermined'
     except Exception, e:
         return "Error " + str(e)
 
